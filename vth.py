@@ -33,16 +33,16 @@ NUM_ROOMS = len(ROOMS)
 
 # ========= BET CONFIG =========
 BASE_BET = 0.1
-MARTINGALE_MULT = 2.5
-MAX_STEP = 5
-MAX_BET = 5.0
-MIN_CONFIDENCE_TO_BET = 0.15
+MARTINGALE_MULT = 1.8
+MAX_STEP = 4
+MAX_BET = 3.0
+MIN_CONFIDENCE_TO_BET = 0.08
 
 # ========= STOP-LOSS / STOP-WIN =========
 STOP_LOSS = -5.0
 STOP_WIN = 20.0
 COOLDOWN_AFTER_STOP = 3
-MAX_CONSECUTIVE_LOSSES = 4
+MAX_CONSECUTIVE_LOSSES = 6
 COOLDOWN_AFTER_STREAK_LOSS = 2
 PROFIT_PROTECT_THRESHOLD = 10.0
 PROFIT_PROTECT_RATIO = 0.5
@@ -76,6 +76,7 @@ class Game:
         self.confidence = 0.0
 
 game = Game()
+_first_connect = True
 
 # ========= STATS =========
 class Stats:
@@ -152,7 +153,9 @@ class BetManager:
         spread = max(vals) - min(vals)
         if spread <= 3:
             return False
-        if stats.win_rate < 0.5 and stats.rounds > 10:
+        if stats.win_rate < 0.55 and stats.rounds > 10:
+            return False
+        if stats.lose_streak >= 3:
             return False
         return True
 
@@ -204,7 +207,8 @@ def fetch_recent():
 def fetch_top100():
     try:
         r = http_session.get(TOP100_API, headers=headers(), timeout=5)
-        return r.json()["data"]["room_id_2_killed_times"]
+        raw = r.json()["data"]["room_id_2_killed_times"]
+        return {int(k): v for k, v in raw.items()}
     except Exception:
         return {}
 
@@ -227,47 +231,84 @@ session_profit = 0
 
 # ========= PREDICTION ENGINE =========
 def compute_risk_scores():
+    """
+    Compute risk score for each room.
+    Higher score = more likely to be killed = AVOID betting on this room.
+    Lower score = less likely to be killed = SAFE to bet on this room.
+    """
     recent = list(history)
-    risk = {}
+    risk = {room: 0.0 for room in ROOMS}
+
+    if not recent:
+        return risk
+
+    n = len(recent)
 
     for room in ROOMS:
-        score = 0.0
+        # --- 1. ANTI-RECENCY: Recently killed rooms are SAFER ---
+        # Game RNGs typically avoid killing the same room consecutively
+        if n >= 1 and recent[-1] == room:
+            risk[room] -= 1.8
+        if n >= 2 and recent[-2] == room:
+            risk[room] -= 0.9
+        if n >= 3 and recent[-3] == room:
+            risk[room] -= 0.4
 
-        short = recent[-5:]
-        for i, val in enumerate(short):
-            if val == room:
-                score += 0.3 * (1 + i * 0.1)
+        # Consecutive kills make room extra safe (triple kill near impossible)
+        if n >= 2 and recent[-1] == recent[-2] == room:
+            risk[room] -= 2.5
 
-        medium = recent[-20:]
-        for i, val in enumerate(medium):
-            if val == room:
-                weight = 0.12 * (1 + i / len(medium))
-                score += weight
+        # --- 2. GAP ANALYSIS: Rounds since last kill ---
+        gap = None
+        for i in range(min(n, 100)):
+            if recent[-(i + 1)] == room:
+                gap = i
+                break
 
-        long_hist = recent[-50:]
-        freq = long_hist.count(room)
-        expected = len(long_hist) / NUM_ROOMS
-        score += max(0, (freq - expected) / max(expected, 1)) * 0.8
+        if gap is not None and gap > 3:
+            if gap >= 20:
+                risk[room] += 1.8
+            elif gap >= 14:
+                risk[room] += 1.2
+            elif gap >= 10:
+                risk[room] += 0.7
+            elif gap >= 7:
+                risk[room] += 0.3
+        elif gap is None:
+            risk[room] += 1.0
 
+        # --- 3. SHORT-TERM FREQUENCY (last 16 rounds) ---
+        if n >= 16:
+            window = recent[-16:]
+            freq = window.count(room)
+            expected = 16 / NUM_ROOMS
+            deviation = (freq - expected) / max(expected, 0.5)
+            if deviation < -0.3:
+                risk[room] += abs(deviation) * 0.8
+            elif deviation > 0.3:
+                risk[room] -= deviation * 0.5
+
+        # --- 4. MEDIUM-TERM FREQUENCY (last 40 rounds) ---
+        if n >= 40:
+            window = recent[-40:]
+            freq = window.count(room)
+            expected = 40 / NUM_ROOMS
+            deviation = (freq - expected) / max(expected, 0.5)
+            if deviation < -0.2:
+                risk[room] += abs(deviation) * 0.6
+            elif deviation > 0.2:
+                risk[room] -= deviation * 0.3
+
+        # --- 5. TOP 100 DATA ---
         if room in top100_data:
             top_freq = top100_data[room]
             top_expected = 100 / NUM_ROOMS
-            deviation = (top_freq - top_expected) / max(top_expected, 1)
-            score += deviation * 1.2
-
-        if len(recent) >= 1 and recent[-1] == room:
-            score += 0.6
-        if len(recent) >= 2 and recent[-2] == room:
-            score += 0.3
-        if len(recent) >= 3 and recent[-1] == recent[-2] == room:
-            score += 0.8
-
-        if len(recent) >= 5:
-            last5 = recent[-5:]
-            if last5.count(room) == 0:
-                score -= 0.4
-
-        risk[room] = score
+            if top_expected > 0:
+                deviation = (top_freq - top_expected) / top_expected
+                if deviation < -0.15:
+                    risk[room] += abs(deviation) * 0.6
+                elif deviation > 0.15:
+                    risk[room] -= deviation * 0.4
 
     return risk
 
@@ -276,35 +317,48 @@ def compute_confidence(risk):
     scores = sorted(risk.values())
     if len(scores) < 2:
         return 0.5
-    gap = scores[2] - scores[0] if len(scores) >= 3 else scores[1] - scores[0]
+    gap_top3 = scores[2] - scores[0] if len(scores) >= 3 else scores[1] - scores[0]
     spread = scores[-1] - scores[0]
-    if spread == 0:
-        return 0.1
-    return min(gap / spread, 1.0)
+
+    if spread < 0.1:
+        return 0.05
+
+    norm_gap = gap_top3 / spread
+    spread_bonus = min(spread / 6.0, 1.0)
+
+    confidence = norm_gap * 0.6 + spread_bonus * 0.4
+
+    # Less confident with limited data
+    if len(history) < 15:
+        confidence *= 0.7
+
+    return min(max(confidence, 0.05), 1.0)
 
 
 def choose():
     risk = compute_risk_scores()
     confidence = compute_confidence(risk)
 
-    safest = sorted(risk, key=risk.get)[:3]
+    sorted_rooms = sorted(risk, key=risk.get)
+    safest3 = sorted_rooms[:3]
 
     if confidence < MIN_CONFIDENCE_TO_BET:
         game.skip_round = True
-        return safest[0], confidence
+        return safest3[0], confidence
 
     game.skip_round = False
 
+    # Sharper weighting toward safest room
+    min_score = risk[safest3[0]]
     weights = []
-    min_score = risk[safest[0]]
-    for room in safest:
-        diff = risk[room] - min_score + 0.01
-        weights.append(1.0 / diff)
+    for room in safest3:
+        diff = risk[room] - min_score + 0.001
+        weights.append(1.0 / (diff ** 1.5))
 
     total_w = sum(weights)
     weights = [w / total_w for w in weights]
 
-    chosen = random.choices(safest, weights=weights, k=1)[0]
+    chosen = random.choices(safest3, weights=weights, k=1)[0]
     return chosen, confidence
 
 
@@ -366,10 +420,8 @@ def draw(cd):
     )
 
 # ========= RESET =========
-def full_reset(ws):
+def full_reset():
     global round_max_cd, last_real_cd, smooth_cd
-
-    print_log("🔄 RESET")
 
     game.issue = None
     game.predicted = None
@@ -381,11 +433,6 @@ def full_reset(ws):
     round_max_cd = None
     last_real_cd = None
     smooth_cd = None
-
-    try:
-        ws.close()
-    except Exception:
-        pass
 
 # ========= WS =========
 def on_message(ws, msg):
@@ -454,20 +501,27 @@ def on_message(ws, msg):
         session_profit += delta
         last_profit = current_profit
 
+        # Periodically refresh top100 data
+        if stats.rounds > 0 and stats.rounds % 10 == 0:
+            top100_data.update(fetch_top100())
+
         print_log(
             f"💀 {killed} | {'WIN' if win else 'LOSE'} | "
             f"Streak +{stats.win_streak}/-{stats.lose_streak} | "
             f"Skip:{stats.skipped} | 💰{session_profit:.2f}"
         )
 
-        full_reset(ws)
+        full_reset()
 
 def on_open(ws):
-    global top100_data, last_profit
+    global top100_data, last_profit, _first_connect
 
     print("✅ Connected")
 
-    history.extend(fetch_recent()[::-1])
+    if _first_connect:
+        history.extend(fetch_recent()[::-1])
+        _first_connect = False
+
     top100_data = fetch_top100()
     last_profit = fetch_profit()
 
@@ -484,6 +538,12 @@ def on_open(ws):
         "user_secret_key": SECRET_KEY
     }))
 
+def on_close(ws, close_status, msg):
+    print_log(f"❌ WebSocket closed ({close_status}), reconnecting...")
+
+def on_error(ws, error):
+    print_log(f"⚠️ WebSocket error: {error}")
+
 def run():
     while True:
         if risk_ctrl.stopped:
@@ -496,9 +556,13 @@ def run():
             break
         try:
             ws = websocket.WebSocketApp(
-                WS_URL, on_open=on_open, on_message=on_message
+                WS_URL,
+                on_open=on_open,
+                on_message=on_message,
+                on_close=on_close,
+                on_error=on_error,
             )
-            ws.run_forever()
+            ws.run_forever(ping_interval=30, ping_timeout=10)
         except Exception as e:
             print_log(f"⚠️ Reconnect {e}")
             time.sleep(2)
