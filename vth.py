@@ -71,7 +71,9 @@ class Game:
         self.issue = None
         self.predicted = None
         self.has_bet = False
+        self.actually_bet = False
         self.skip_round = False
+        self.confidence = 0.0
 
 game = Game()
 
@@ -289,7 +291,7 @@ def choose():
 
     if confidence < MIN_CONFIDENCE_TO_BET:
         game.skip_round = True
-        return safest[0]
+        return safest[0], confidence
 
     game.skip_round = False
 
@@ -372,7 +374,9 @@ def full_reset(ws):
     game.issue = None
     game.predicted = None
     game.has_bet = False
+    game.actually_bet = False
     game.skip_round = False
+    game.confidence = 0.0
 
     round_max_cd = None
     last_real_cd = None
@@ -406,17 +410,12 @@ def on_message(ws, msg):
         draw(cd)
 
         if game.predicted is None:
-            result = choose()
-            if isinstance(result, tuple):
-                game.predicted, confidence = result
-            else:
-                game.predicted = result
-                confidence = 0.0
+            game.predicted, game.confidence = choose()
 
             if game.skip_round:
                 print_log(f"🤖 Predict {game.predicted} (LOW CONF — skip)")
             else:
-                print_log(f"🤖 Predict {game.predicted} (conf={confidence:.2f})")
+                print_log(f"🤖 Predict {game.predicted} (conf={game.confidence:.2f})")
 
         if cd <= 3 and not game.has_bet:
             can_bet, reason = risk_ctrl.check(session_profit, stats.lose_streak)
@@ -430,14 +429,13 @@ def on_message(ws, msg):
                 game.has_bet = True
                 stats.skipped += 1
             else:
-                result = choose()
-                confidence = result[1] if isinstance(result, tuple) else 0.5
                 threading.Thread(
                     target=place_bet,
-                    args=(issue, game.predicted, confidence),
+                    args=(issue, game.predicted, game.confidence),
                     daemon=True,
                 ).start()
                 game.has_bet = True
+                game.actually_bet = True
 
     if "result" in msg_type:
         killed = data.get("killed_room")
@@ -446,8 +444,9 @@ def on_message(ws, msg):
 
         win = killed != game.predicted
 
-        stats.record(win)
-        bet_manager.update(win)
+        if game.actually_bet:
+            stats.record(win)
+            bet_manager.update(win)
         history.append(killed)
 
         current_profit = fetch_profit()
