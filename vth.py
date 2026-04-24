@@ -133,6 +133,7 @@ class RiskController:
 
         if lose_streak >= MAX_CONSECUTIVE_LOSSES:
             self.cooldown_rounds = COOLDOWN_AFTER_STREAK_LOSS
+            stats.lose_streak = 0
             return False, f"Streak pause ({lose_streak} losses)"
 
         self.stopped = False
@@ -401,8 +402,11 @@ def on_message(ws, msg):
 
     if issue and issue != game.issue:
         game.issue = issue
+        game.predicted = None
         game.has_bet = False
+        game.actually_bet = False
         game.skip_round = False
+        game.confidence = 0.0
         print_log(f"\n===== ROUND {issue} =====")
 
     if "count_down" in msg_type:
