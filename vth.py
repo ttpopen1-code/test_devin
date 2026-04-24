@@ -278,7 +278,7 @@ def fetch_profit():
 history = deque(maxlen=200)
 top100_data = {}
 _cached_history_list = []
-_cached_history_len = -1
+_history_version = 0
 
 last_profit = 0
 session_profit = 0
@@ -286,12 +286,17 @@ rounds_since_top100 = 0
 rounds_since_profit = 0
 
 
+def _invalidate_history_cache():
+    global _history_version
+    _history_version += 1
+
+
 def _get_history_list():
-    """[Performance] Cache list(history) — only rebuild when history changes."""
-    global _cached_history_list, _cached_history_len
-    if len(history) != _cached_history_len:
+    """[Performance] Cache list(history) — rebuild only when explicitly invalidated."""
+    global _cached_history_list, _history_version
+    if _history_version != getattr(_get_history_list, '_ver', -1):
         _cached_history_list = list(history)
-        _cached_history_len = len(history)
+        _get_history_list._ver = _history_version
     return _cached_history_list
 
 
@@ -573,23 +578,21 @@ def on_message(ws, msg):
             stats.record(win, game.bet_amount)
             bet_manager.update(win)
         history.append(killed)
+        _invalidate_history_cache()
 
-        # [Stability] Move profit fetch to background thread to avoid
-        # blocking the WebSocket message loop with HTTP requests
-        def _update_profit():
-            global last_profit, session_profit, rounds_since_profit
-            rounds_since_profit += 1
-            # [Performance] Only fetch profit every N rounds
-            if rounds_since_profit < PROFIT_FETCH_INTERVAL:
-                return
+        # [Stability] Profit fetch in background thread; counter checked
+        # in main thread to avoid race conditions between threads
+        rounds_since_profit += 1
+        if rounds_since_profit >= PROFIT_FETCH_INTERVAL:
             rounds_since_profit = 0
-            result = fetch_profit()
-            if result is not None:
-                delta = result - last_profit
-                session_profit += delta
-                last_profit = result
-
-        threading.Thread(target=_update_profit, daemon=True).start()
+            def _update_profit():
+                global last_profit, session_profit
+                result = fetch_profit()
+                if result is not None:
+                    delta = result - last_profit
+                    session_profit += delta
+                    last_profit = result
+            threading.Thread(target=_update_profit, daemon=True).start()
 
         # [Performance] Refresh top100 data periodically
         rounds_since_top100 += 1
